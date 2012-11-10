@@ -23,6 +23,17 @@ __version__ = "1.5.1"
 __author__ = "Nicolas Hennion <nicolas@nicolargo.com>"
 __licence__ = "LGPL"
 
+# Ignore the following FS name
+IGNORE_FSNAME = ('', 'none', 'gvfs-fuse-daemon', 'fusectl',
+        'cgroup')
+
+# Ignore the following FS type
+IGNORE_FSTYPE = ('binfmt_misc', 'devpts', 'iso9660', 'none',
+        'proc', 'sysfs', 'usbfs', 'rootfs', 'autofs',
+        'devtmpfs')
+
+
+
 # Libraries
 #==========
 
@@ -40,6 +51,35 @@ gettext.install(__appname__)
 # Selective lib
 import json
 import collections
+
+from rackspace_monitoring.providers import get_driver
+from rackspace_monitoring.types import Provider
+import raxmon_cli.utils
+from raxmon_cli.constants import GLOBAL_OPTIONS, ACTION_OPTIONS
+from raxmon_cli.constants import API_URL_ADDRESS
+
+import libcloud.security
+from libcloud import _init_once
+
+CA_CERT_PATH = os.path.join(os.path.abspath(os.path.dirname(__file__)),
+                            'data/cacert.pem')
+libcloud.security.CA_CERTS_PATH.insert(0, CA_CERT_PATH)
+
+def get_rackspace_monitoring_instance():
+    result = raxmon_cli.utils.get_config()
+    username, api_key = result['username'], result['api_key']
+    api_url, auth_url = result['api_url'], result['auth_url']
+    ssl_verify = result['ssl_verify']
+    api_url = api_url or API_URL_ADDRESS
+
+    driver = get_driver(Provider.RACKSPACE)
+
+    kwargs = {}
+    kwargs['ex_force_base_url'] = api_url
+    kwargs['ex_force_auth_url'] = auth_url
+    instance = driver(username, api_key, **kwargs)
+
+    return instance
 
 try:
     # For Python v2.x
@@ -313,13 +353,10 @@ class glancesGrabFs:
         """
 
         # Ignore the following FS name
-        self.ignore_fsname = ('', 'none', 'gvfs-fuse-daemon', 'fusectl',
-                              'cgroup')
+        self.ignore_fsname = IGNORE_FSNAME
 
         # Ignore the following FS type
-        self.ignore_fstype = ('binfmt_misc', 'devpts', 'iso9660', 'none',
-                              'proc', 'sysfs', 'usbfs', 'rootfs', 'autofs',
-                              'devtmpfs')
+        self.ignore_fstype = IGNORE_FSTYPE
 
     def __update__(self):
         """
@@ -2349,6 +2386,368 @@ class GlancesServer():
         self.server.server_close()
 
 
+
+class rackspaceGlancesStats:
+    """
+    This class store, update and give stats
+    """
+
+    def __init__(self):
+        """
+        Init the stats
+        """
+
+        self.all_stats = collections.defaultdict(dict)
+
+    def __get_process_stats_NEW__(self, proc):
+        """
+        Get process (proc) statistics
+        !!! No performance gap (CPU %)
+        !!! Without: 1.5 - 2.0 
+        !!! With:    2.0 - 2.2
+
+        """
+        procstat = proc.as_dict(['get_memory_info', 'get_cpu_percent', 'get_memory_percent',
+                                 'pid', 'username', 'get_nice',
+                                 'get_cpu_times', 'name', 'status', 'cmdline'])
+        if psutil_get_io_counter_tag:
+            procstat['io_counters']  = proc.get_io_counters()      
+        procstat['status'] = str(procstat['status'])[:1].upper()
+        procstat['cmdline'] = " ".join(procstat['cmdline'])
+
+        return procstat
+
+    def __get_process_stats__(self, proc):
+        """
+        Get process (proc) statistics
+        """
+        procstat = {}
+
+        procstat['memory_info'] = proc.get_memory_info()
+
+        if psutil_get_cpu_percent_tag:
+            procstat['cpu_percent'] = \
+                proc.get_cpu_percent(interval=0)
+
+        procstat['memory_percent'] = proc.get_memory_percent()
+
+        try:
+            if psutil_get_io_counter_tag:
+                procstat['io_counters']  = proc.get_io_counters()
+        except:
+            procstat['io_counters'] = {}
+
+        procstat['pid'] = proc.pid
+        procstat['username'] = proc.username
+
+        if hasattr(proc, 'get_nice'):
+            # Deprecated in PsUtil 0.5.0+
+            procstat['nice'] = proc.get_nice()
+        elif hasattr(proc, 'nice'):
+            # Else
+            procstat['nice'] = proc.nice
+        else:
+            # Never here...
+            procstat['nice'] = 0
+
+        procstat['status'] = str(proc.status)[:1].upper()
+        procstat['cpu_times'] = proc.get_cpu_times()
+        procstat['name'] = proc.name
+        procstat['cmdline'] = " ".join(proc.cmdline)
+
+        return procstat
+
+
+    def __update__(self, input_stats):
+        """
+        Update the stats
+        """
+
+        # Get the current date/time
+        self.now = datetime.now()
+
+        self.host = input_stats["host"]
+        self.cpu = input_stats["cpu"]
+        self.percpu = input_stats["percpu"]
+        self.network = input_stats["network"]
+        self.core_number = len(self.percpu)
+        self.diskio = input_stats["diskio"]
+        self.fs = input_stats["fs"]
+        self.mem = input_stats["mem"]
+        self.memswap = input_stats["memswap"]
+        self.process = input_stats["process"]
+        self.processcount = input_stats["processcount"]
+        # TODO
+        self.load = {}
+        self.process_list_refresh = True
+
+
+    def update(self, input_stats = {}):
+        # Update the stats
+        self.__update__(input_stats)
+
+    def getAll(self):
+        return self.all_stats
+
+    def getHost(self):
+        return self.host
+
+    def getSystem(self):
+        return self.host
+
+    def getCpu(self):
+        return self.cpu
+
+    def getPerCpu(self):
+        return self.percpu
+
+    def getCore(self):
+        return self.core_number
+
+    def getLoad(self):
+        return self.load
+
+    def getMem(self):
+        return self.mem
+
+    def getMemSwap(self):
+        return self.memswap
+
+    def getNetwork(self):
+        if psutil_network_io_tag:
+            return sorted(self.network,
+                          key=lambda network: network['interface_name'])
+        else:
+            return 0
+
+    def getDiskIO(self):
+        if psutil_disk_io_tag:
+            return sorted(self.diskio, key=lambda diskio: diskio['disk_name'])
+        else:
+            return 0
+
+    def getFs(self):
+        if psutil_fs_usage_tag:
+            return sorted(self.fs, key=lambda fs: fs['mnt_point'])
+        else:
+            return 0
+
+    def getProcessCount(self):
+        return self.processcount
+
+    def getProcessList(self, sortedby='auto'):
+        """
+        Return the sorted process list
+        """
+
+        if self.process == {}:
+            return self.process
+
+        sortedReverse = True
+        if sortedby == 'auto':
+            if psutil_get_cpu_percent_tag:
+                sortedby = 'cpu_percent'
+            else:
+                sortedby = 'memory_percent'
+            # Auto selection
+            # If global MEM > 70% sort by MEM usage
+            # else sort by CPU usage
+            if (self.mem['total'] != 0):
+                memtotal = ((self.mem['used'] - self.mem['cache']) * 100) / self.mem['total']
+                if memtotal > limits.getSTDWarning():
+                    sortedby = 'memory_percent'
+        elif sortedby == 'name':
+            sortedReverse = False
+
+        return sorted(self.process, key=lambda process: process[sortedby],
+                      reverse=sortedReverse)
+
+    def getNow(self):
+        return self.now
+
+def systemMap(old, info, stats):
+    host = {}
+    host['os_name'] = info['name']
+    host['hostname'] = agent_id
+    host['platform'] = info['name']
+    host['linux_distro'] = info['vendor']
+    host['os_version'] = info['vendor_version']
+
+    return {'host': host}
+
+def filesystemsMap(old, info, stats):
+    fs_list = []
+
+    for fs in info:
+        fs_current = {}
+        fs_current['device_name'] = fs['dev_name']
+        if fs_current['device_name'] in IGNORE_FSNAME:
+            continue
+        fs_current['fs_type'] = fs['sys_type_name']
+        if fs_current['fs_type'] in IGNORE_FSTYPE:
+            continue
+        fs_current['mnt_point'] = fs['dir_name']
+        if fs['total']:
+            fs['total'] = fs['total'] * 1024
+            fs['avail'] = fs['avail'] * 1024
+            fs_current['size'] = fs['total']
+            fs_current['avail'] = fs['avail']
+
+            if hasattr(fs, 'used'):
+                fs['used'] = fs['used'] * 1024
+                fs_current['used'] = fs['used']
+            else:
+                fs_current['used'] = fs['total'] - fs['avail']
+
+        fs_list.append(fs_current)
+
+    return {'fs': fs_list}
+
+def percpuMap(old, info, stats):
+    percpu_list = []
+    perpercent = []
+
+    for i in range(len(info)):
+        d = info[i]['total'] - old[i]['total']
+        # TODO fix this
+        if d == 0:
+            d = 1
+        perpercent.append(100.0 / d)
+
+        cpu = {'kernel': (info[i]['sys'] - old[i]['sys']) * perpercent[i],
+               'user': (info[i]['user'] - old[i]['user']) * perpercent[i],
+               'idle': (info[i]['idle'] - old[i]['idle']) * perpercent[i]}
+
+        if hasattr(info[i], 'nice'):
+            cpu['nice'] = (info[i]['nice'] - old[i]['nice']) * perpercent[i]
+
+        percpu_list.append(cpu)
+
+    return {'percpu': percpu_list, 'cpu': []}
+
+def processesMap(old, info, stats):
+    process_list = []
+
+    processcount = {'total': 0, 'running': 0, 'sleeping': 0}
+
+    for i in info:
+        p = {}
+
+        p['name'] = i.get('state_name', 'none')
+        p['cmdline'] = i.get('state_name', 'none')
+        p['username'] = 'none'
+        p['memory_info'] = [i.get('memory_resident', 0), i.get('memory_size', 0)]
+        p['cpu_percent'] = 0
+        p['cpu_times'] = i.get('time_total', 0)
+        p['memory_percent'] = float(i.get('memory_resident', 0)) / stats['mem']['total']
+        p['pid'] = i['pid']
+        p['uid'] = 0
+        p['nice'] = 0
+        p['status'] = 0
+        p['io_counters'] = {}
+        processcount['total'] += 1
+        processcount['running'] += 1
+
+        process_list.append(p)
+
+    return {'process': process_list, 'processcount': processcount}
+
+def disksMap(old, info, stats):
+    disk_list = []
+
+    for i in range(len(info)):
+        diskstat = {}
+        diskstat['disk_name'] = info[i]['name']
+        diskstat['read_bytes'] = info[i]['read_bytes'] - old[i]['read_bytes']
+        diskstat['write_bytes'] = info[i]['write_bytes'] - old[i]['write_bytes']
+
+        disk_list.append(diskstat)
+
+    return {'diskio': disk_list}
+
+def networkMap(old, info, stats):
+    net_list = []
+
+    for i in range(len(info)):
+        net = {}
+        net['interface_name'] = info[i]['name']
+        net['rx'] = info[i]['rx_bytes'] - old[i]['rx_bytes']
+        net['tx'] = info[i]['tx_bytes'] - old[i]['tx_bytes']
+        net_list.append(net)
+
+    return {'network': net_list}
+
+def memoryMap(old, info, stats):
+    mem = {}
+    memswap = {}
+
+    mem['cache'] = 0
+    mem['total'] = info['total']
+    mem['used'] = info['actual_used']
+    mem['free'] = info['actual_free']
+    mem['percent'] = float(info['actual_used']) / info['total']
+
+    # TODO remove this after agent is fixed
+    if hasattr(info, 'swap_total'):
+        memswap['total'] = info['swap_total']
+        memswap['used'] = info['swap_used']
+        memswap['free'] = info['swap_free']
+        memswap['percent'] = float(info['swap_used']) / info['swap_percent']
+    else:
+        memswap['total'] = 0
+        memswap['used'] = 0
+        memswap['free'] = 0
+        memswap['percent'] = 0
+
+    return {'mem': mem, 'memswap': memswap}
+
+
+class GlancesRackspaceAgentClient():
+    types = [
+            {'name': 'system', 'mapper': systemMap},
+            {'name': 'filesystems', 'mapper': filesystemsMap},
+            {'name': 'cpus', 'mapper': percpuMap},
+            {'name': 'network_interfaces', 'mapper': networkMap},
+            {'name': 'disks', 'mapper': disksMap},
+            {'name': 'memory', 'mapper': memoryMap},
+            {'name': 'processes', 'mapper': processesMap},
+    ]
+
+    info_types = []
+    for t in types:
+        info_types.append(t['name'])
+
+    """
+    This class creates and manages the Rackspace agent client
+    """
+
+    def __init__(self, agent_id):
+        self.agent_id = agent_id
+        self.client = get_rackspace_monitoring_instance()
+        self.old = self._get()
+        return
+
+    def _get(self):
+        infos = {}
+        result = self.client.ex_views_agent_host_info(agentIds=[agent_id], includes=self.info_types)
+        for t in self.types:
+            infos[t['name']] = result[0]['host_info'][t['name']]['info']
+
+        return infos
+
+    def client_get(self):
+        stats = {}
+        infos = self._get()
+
+        for t in self.types:
+            result = infos[t['name']]
+            mapped = t['mapper'](self.old[t['name']], result, stats)
+            stats = dict(stats.items() + mapped.items())
+            self.old[t['name']] = result
+
+        return stats
+
+
 class GlancesClient():
     """
     This class creates and manages the TCP client
@@ -2440,10 +2839,11 @@ def main():
     global network_bytepersec_tag
     global limits, logs, stats, screen
     global htmloutput, csvoutput
-    global html_tag, csv_tag, server_tag, client_tag
+    global html_tag, csv_tag, server_tag, client_tag, agent_tag
     global psutil_get_cpu_percent_tag, psutil_get_io_counter_tag, psutil_mem_usage_tag
     global psutil_mem_vm, psutil_fs_usage_tag, psutil_disk_io_tag, psutil_network_io_tag
     global refresh_time, client, server, server_port, server_ip
+    global rackspace, agent_id
 
     # Set default tags
     network_bytepersec_tag = False
@@ -2465,7 +2865,7 @@ def main():
 
     # Manage args
     try:
-        opts, args = getopt.getopt(sys.argv[1:], "B:bdmnho:f:t:vsc:p:",
+        opts, args = getopt.getopt(sys.argv[1:], "B:bdmnho:f:t:vsc:p:a:",
                                    ["bind", "bytepersec", "diskio", "mount", 
                                     "netrate", "help", "output", "file",
                                     "time", "version", "server",
@@ -2479,6 +2879,8 @@ def main():
         if opt in ("-v", "--version"):
             printVersion()
             sys.exit(0)
+        elif opt in ("-a", "--agent-id"):
+            agent_id = arg
         elif opt in ("-s", "--server"):
             server_tag = True
         elif opt in ("-B", "--bind"):
@@ -2669,6 +3071,22 @@ def main():
 
         # Init screen
         screen = glancesScreen(refresh_time=refresh_time)            
+    elif agent_id:
+        # Init the client (displaying server stat in the CLI)
+
+        client = GlancesRackspaceAgentClient(agent_id)
+
+        # Init Limits
+        limits = glancesLimits()
+
+        # Init Logs
+        logs = glancesLogs()
+
+        # Init stats
+        stats = rackspaceGlancesStats()
+
+        # Init screen
+        screen = glancesScreen(refresh_time=refresh_time)            
     else:
         # Init the classical CLI
         
@@ -2700,7 +3118,7 @@ def main():
     if server_tag:
         # Start the server loop
         server.serve_forever()
-    elif client_tag:
+    elif client_tag or agent_id:
         # Start the client (CLI) loop
         while True:           
             # Get server system informations
